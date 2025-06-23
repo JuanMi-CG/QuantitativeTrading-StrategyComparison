@@ -200,22 +200,106 @@ class PerformanceAnalyzer:
 
 
 
-# --- Optimizer ---
 class Optimizer:
-    def __init__(self, strategy_cls: Type[TradingStrategy], param_grid: Dict[str, List[Any]]):
-        self.strategy_cls, self.param_grid = strategy_cls, param_grid
+    """
+    Grid‐search over strategy parameters, ranking by a chosen performance metric.
+    - Invalid combos (in __init__ or backtest) are caught & skipped.
+    - You can retrieve best params (native types) or a fully backtested strategy safely.
+    """
+    def __init__(
+        self,
+        strategy_cls: Type[TradingStrategy],
+        param_grid: Dict[str, List[Any]]
+    ):
+        self.strategy_cls = strategy_cls
+        self.param_grid   = param_grid
 
-    def optimize(self, data: pd.DataFrame, metric: str = 'Sharpe') -> pd.DataFrame:
-        records = []
+    def optimize(
+        self,
+        data: pd.DataFrame,
+        metric: str = 'Sharpe'
+    ) -> pd.DataFrame:
+        """
+        Run backtests over the cartesian product of self.param_grid,
+        compute summary metrics, and return a DataFrame sorted by `metric`.
+        Invalid parameter sets are skipped with a warning.
+        """
+        records: List[Dict[str, Any]] = []
+
         for vals in product(*self.param_grid.values()):
             params = dict(zip(self.param_grid.keys(), vals))
-            strat  = self.strategy_cls(**params)
-            eq     = strat.backtest(data)
-            perf   = PerformanceAnalyzer(eq, strat.returns).summary()
-            for k,v in params.items(): perf[k] = v
-            records.append(perf)
-        df = pd.DataFrame(records).sort_values(by=metric, ascending=False).reset_index(drop=True)
-        return df
+            try:
+                strat = self.strategy_cls(**params)
+                eq    = strat.backtest(data)
+                perf  = PerformanceAnalyzer(eq, strat.returns).summary()
+            except Exception as e:
+                logging.warning(
+                    f"Optimizer: skipping {self.strategy_cls.__name__}{params} due to: {e}"
+                )
+                continue
+
+            # Merge metrics + original params into one record dict
+            rec = perf.to_dict()
+            rec.update(params)
+            records.append(rec)
+
+        if not records:
+            raise ValueError(
+                f"No valid parameter combinations for {self.strategy_cls.__name__}"
+            )
+
+        df = pd.DataFrame(records)
+        return df.sort_values(by=metric, ascending=False).reset_index(drop=True)
+
+    def best_params(
+        self,
+        results: pd.DataFrame,
+        idx: int = 0
+    ) -> Dict[str, Any]:
+        """
+        Return the top‐ranked parameter combination as a native‐typed dict.
+        """
+        row = results.iloc[idx]
+        out: Dict[str, Any] = {}
+        for k in self.param_grid:
+            v = row[k]
+            # unwrap numpy scalars
+            if hasattr(v, "item"):
+                v = v.item()
+            # convert floats that are actually ints
+            if isinstance(v, float) and v.is_integer():
+                v = int(v)
+            out[k] = v
+        return out
+
+    def best_strategy(
+        self,
+        data: pd.DataFrame,
+        metric: str = 'Sharpe',
+        idx: int = 0
+    ) -> Tuple[TradingStrategy, pd.Series, pd.DataFrame]:
+        """
+        1) Runs optimize()  
+        2) Finds the best params  
+        3) Safely instantiates & backtests that single strategy  
+        Returns (strategy_instance, equity_curve, full_results_df).
+        """
+        results = self.optimize(data, metric)
+        params  = self.best_params(results, idx)
+
+        try:
+            strat = self.strategy_cls(**params)
+            eq    = strat.backtest(data)
+        except Exception as e:
+            logging.warning(
+                f"Optimizer.best_strategy: failed to backtest best "
+                f"{self.strategy_cls.__name__}{params} due to: {e}"
+            )
+            # return None strategy/equity so the caller can skip if desired
+            return None, None, results
+
+        return strat, eq, results
+
 
 
 class StrategyManager:
