@@ -5,7 +5,7 @@ import os
 import yfinance as yf
 from datetime import time 
 import matplotlib.pyplot as plt
-from typing import Union, List, Dict, Optional, Callable, Type, Iterator
+from typing import Union, List, Dict, Optional, Callable, Type, Iterator, Tuple
 from itertools import product
 import inspect
 

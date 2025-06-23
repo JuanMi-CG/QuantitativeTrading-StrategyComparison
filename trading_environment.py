@@ -198,16 +198,7 @@ class PerformanceAnalyzer:
             'Win Rate': wr, 'Profit Factor': pf, 'Expectancy': exp
         })
 
-    def report(self, save: bool = False, do_print: bool = False, report_name: Optional[str] = None) -> None:
-        summary = self.summary()
-        if do_print:
-            print(f"Performance Report ({report_name}):")
-            print(summary.to_string(float_format=lambda x: f"{x:.4f}"))
-        if save:
-            fname = report_name or f"report_{datetime.now():%Y%m%d_%H%M%S}"
-            path = REPORT_DIR / f"{fname}.csv"
-            summary.to_csv(path)
-            logging.info(f"Guardado reporte en {path}")
+
 
 # --- Optimizer ---
 class Optimizer:
@@ -226,7 +217,7 @@ class Optimizer:
         df = pd.DataFrame(records).sort_values(by=metric, ascending=False).reset_index(drop=True)
         return df
 
-# --- StrategyManager y ReportManager ---
+
 class StrategyManager:
     """
     Guarda y carga estrategias en strategies/ como pickle.
@@ -434,7 +425,38 @@ class ReportManager:
         plt.legend()
         plt.show()
 
-        
+    def save_summary(self, name: str, summary: pd.Series) -> None:
+        path = self.directory / f"{name}.csv"
+        summary.to_csv(path)
+        logging.info(f"Saved report to {path}")
+
+    def print_summary(self, name: str, summary: pd.Series) -> None:
+        print(f"Performance Report ({name}):")
+        print(summary.to_string(float_format=lambda x: f"{x:.4f}"))
+
+    def summarize(self,
+                  analyzers: Union[PerformanceAnalyzer, Dict[str,PerformanceAnalyzer]],
+                  save: bool = False,
+                  do_print: bool = False):
+        if isinstance(analyzers, PerformanceAnalyzer):
+            summaries = { analyzers.equity.name: analyzers.summary() }
+        else:
+            summaries = {name: pa.summary() for name, pa in analyzers.items()}
+
+        # single or multi
+        if len(summaries) == 1:
+            name, summary = next(iter(summaries.items()))
+            if do_print: self.print_summary(name, summary)
+            if save:  self.save_summary(name, summary)
+            return summary
+        else:
+            df = pd.DataFrame(summaries).T
+            if do_print:
+                print("Combined Performance Report:")
+                print(df.to_string(float_format=lambda x: f"{x:.4f}"))
+            if save:
+                self.save_summary("comparison_report", df)
+            return df
 
 # --- TradingSystem ---
 class TradingSystem:
@@ -482,7 +504,9 @@ class TradingSystem:
             stop_loss=stop_loss
         )
         analyzer = PerformanceAnalyzer(eq, self.strategy.returns)
-        analyzer.report(save=save_report, do_print=do_print, report_name=report_name)
+        # analyzer.report(save=save_report, do_print=do_print, report_name=report_name)
+        rm = ReportManager()
+        rm.summarize(analyzer, save=save_report, do_print=do_print)
         return eq
 
 
@@ -493,14 +517,27 @@ class StrategyCollection:
     Permite iterar, guardar y backtestear todas las estrategias de la colección de forma centralizada.
     Estrategias inválidas (por ejemplo, parámetros que lanzan errores) se omiten con advertencia.
     """
-    def __init__(
-        self,
-        strategy_cls: Type['TradingStrategy'],
-        param_grid: Dict[str, List[Any]]
+    def __init__(self,
+                 strategy_cls: Type['TradingStrategy'] = None,
+                 param_grid: Dict[str, List[Any]] = None,
+                 strategies: Optional[List[TradingStrategy]] = None
     ):
+        self.strategies: Dict[str, TradingStrategy] = {}
+
+        if strategies is not None:
+            # load from provided list
+            for strat in strategies:
+                if strat.name in self.strategies:
+                    logging.warning(f"Duplicate strategy name '{strat.name}', skipping")
+                    continue
+                self.strategies[strat.name] = strat
+            return
+
+        # otherwise, must have strategy_cls & param_grid
+        if strategy_cls is None or param_grid is None:
+            raise ValueError("Must provide either `strategies` or (`strategy_cls` and `param_grid`)")
         self.strategy_cls = strategy_cls
-        self.param_grid = param_grid
-        self.strategies: Dict[str, 'TradingStrategy'] = {}
+        self.param_grid  = param_grid
         self._generate_strategies()
 
     def _generate_strategies(self) -> None:
@@ -582,20 +619,6 @@ class StrategyCollection:
             strategy_manager.save(strat)
 
     @classmethod
-    def load_all(
-        cls,
-        names: List[str],
-        strategy_manager: 'StrategyManager'
-    ) -> 'StrategyCollection':
-        """
-        Carga un conjunto de estrategias por nombre y las agrupa en una nueva colección.
-        Nota: `param_grid` será vacío; solo se usan las instancias cargadas.
-        """
-        collection = cls.__new__(cls)
-        collection.strategy_cls = None
-        collection.param_grid = {}
-        collection.strategies = {}
-        for name in names:
-            strat = strategy_manager.load(name)
-            collection.strategies[name] = strat
-        return collection
+    def load_all(cls, names: List[str], strategy_manager: StrategyManager):
+        strategies = [ strategy_manager.load(n) for n in names ]
+        return cls(strategies=strategies)
