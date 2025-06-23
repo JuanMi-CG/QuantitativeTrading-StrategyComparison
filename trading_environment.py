@@ -209,10 +209,12 @@ class Optimizer:
     def __init__(
         self,
         strategy_cls: Type[TradingStrategy],
-        param_grid: Dict[str, List[Any]]
+        param_grid: Dict[str, List[Any]],
+        display_warnings: bool = False
     ):
         self.strategy_cls = strategy_cls
         self.param_grid   = param_grid
+        self.display_warnings   = display_warnings
 
     def optimize(
         self,
@@ -233,9 +235,10 @@ class Optimizer:
                 eq    = strat.backtest(data)
                 perf  = PerformanceAnalyzer(eq, strat.returns).summary()
             except Exception as e:
-                logging.warning(
-                    f"Optimizer: skipping {self.strategy_cls.__name__}{params} due to: {e}"
-                )
+                if self.display_warnings:
+                    logging.warning(
+                        f"Optimizer: skipping {self.strategy_cls.__name__}{params} due to: {e}"
+                    )
                 continue
 
             # Merge metrics + original params into one record dict
