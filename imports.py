@@ -22,3 +22,7 @@ import yfinance as yf
 import matplotlib.pyplot as plt
 import seaborn as sns
 from itertools import product
+
+from scipy.optimize import differential_evolution
+import optuna
+import ta

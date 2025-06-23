@@ -201,13 +201,25 @@ class PairTradingStrategy(TradingStrategy):
 
 
 class VWAPStrategy(TradingStrategy):
-    def __init__(self):
-        super().__init__(name="VWAP")
+    def __init__(self, price_col: str = 'close'):
+        super().__init__(name="VWAP", price_col=price_col)
 
-    def generate_signals(self, data):
-        # assumes data has intraday 'volume' & 'typical_price'
-        vp  = (data['typical_price'] * data['volume']).cumsum()
-        v   = data['volume'].cumsum()
-        vwap = vp / v
-        sig = (data[self.price_col] > vwap).astype(int)*2 - 1
+    def generate_signals(self, data: pd.DataFrame) -> pd.Series:
+        # 1) compute typical price if not present
+        if 'typical_price' in data.columns:
+            tp = data['typical_price']
+        else:
+            # assume data has 'high','low','close'
+            tp = data[['high','low', self.price_col]].mean(axis=1)
+
+        # 2) cumulative VWAP
+        volume = data['volume']
+        cum_vp = (tp * volume).cumsum()
+        cum_v  = volume.cumsum()
+        vwap   = cum_vp / cum_v
+
+        # 3) signal: long when price > VWAP, short when < VWAP
+        price = data[self.price_col]
+        sig   = (price > vwap).astype(int) * 2 - 1
+
         return sig.ffill().fillna(0)

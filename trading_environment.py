@@ -200,76 +200,140 @@ class PerformanceAnalyzer:
 
 
 
+import logging
+from itertools import product
+from typing import Type, Dict, Any, List, Tuple, Optional
+
+import pandas as pd
+from scipy.optimize import differential_evolution
+import optuna
+
+from trading_environment import TradingStrategy, PerformanceAnalyzer
+
 class Optimizer:
     """
-    Grid‐search over strategy parameters, ranking by a chosen performance metric.
-    - Invalid combos (in __init__ or backtest) are caught & skipped.
-    - You can retrieve best params (native types) or a fully backtested strategy safely.
+    Three optimization routines over your strategy’s parameter space,
+    plus helpers to extract best params and build the best strategy safely.
     """
+
     def __init__(
         self,
         strategy_cls: Type[TradingStrategy],
-        param_grid: Dict[str, List[Any]],
-        display_warnings: bool = False
+        param_grid: Dict[str, List[Any]]
     ):
         self.strategy_cls = strategy_cls
         self.param_grid   = param_grid
-        self.display_warnings   = display_warnings
 
-    def optimize(
+    def optimize_grid(
         self,
         data: pd.DataFrame,
         metric: str = 'Sharpe'
     ) -> pd.DataFrame:
-        """
-        Run backtests over the cartesian product of self.param_grid,
-        compute summary metrics, and return a DataFrame sorted by `metric`.
-        Invalid parameter sets are skipped with a warning.
-        """
+        """Brute‐force grid search."""
         records: List[Dict[str, Any]] = []
-
         for vals in product(*self.param_grid.values()):
             params = dict(zip(self.param_grid.keys(), vals))
             try:
                 strat = self.strategy_cls(**params)
                 eq    = strat.backtest(data)
-                perf  = PerformanceAnalyzer(eq, strat.returns).summary()
+                perf  = PerformanceAnalyzer(eq, strat.returns).summary().to_dict()
+                perf.update(params)
+                records.append(perf)
             except Exception as e:
-                if self.display_warnings:
-                    logging.warning(
-                        f"Optimizer: skipping {self.strategy_cls.__name__}{params} due to: {e}"
-                    )
-                continue
-
-            # Merge metrics + original params into one record dict
-            rec = perf.to_dict()
-            rec.update(params)
-            records.append(rec)
-
+                logging.warning(f"Grid skip {params}: {e}")
         if not records:
-            raise ValueError(
-                f"No valid parameter combinations for {self.strategy_cls.__name__}"
-            )
+            raise ValueError(f"No valid grid combinations for {self.strategy_cls.__name__}")
+        return pd.DataFrame(records).sort_values(by=metric, ascending=False).reset_index(drop=True)
 
-        df = pd.DataFrame(records)
-        return df.sort_values(by=metric, ascending=False).reset_index(drop=True)
+    def optimize_bayesian(
+        self,
+        data: pd.DataFrame,
+        metric: str = 'Sharpe',
+        n_trials: int = 50,
+        seed: Optional[int] = None
+    ) -> Tuple[Dict[str, Any], float, optuna.Study]:
+        """Bayesian optimization via Optuna."""
+        def _objective(trial: optuna.Trial) -> float:
+            kwargs: Dict[str, Any] = {}
+            for k, choices in self.param_grid.items():
+                if all(isinstance(c, int) for c in choices):
+                    low, high = min(choices), max(choices)
+                    kwargs[k] = trial.suggest_int(k, low, high)
+                elif all(isinstance(c, float) for c in choices):
+                    low, high = min(choices), max(choices)
+                    kwargs[k] = trial.suggest_float(k, low, high)
+                else:
+                    kwargs[k] = trial.suggest_categorical(k, choices)
+            strat = self.strategy_cls(**kwargs)
+            eq    = strat.backtest(data)
+            perf  = PerformanceAnalyzer(eq, strat.returns).summary()[metric]
+            return -perf  # minimize negative Sharpe
+
+        study = optuna.create_study(
+            direction='minimize',
+            sampler=optuna.samplers.TPESampler(seed=seed)
+        )
+        study.optimize(_objective, n_trials=n_trials)
+
+        best_params = study.best_params
+        best_metric = -study.best_value
+        return best_params, best_metric, study
+
+    def optimize_de(
+        self,
+        data: pd.DataFrame,
+        metric: str = 'Sharpe',
+        maxiter: int = 30,
+        popsize: int = 10
+    ) -> Tuple[Dict[str, Any], float, object]:
+        """Differential Evolution via SciPy."""
+        keys = list(self.param_grid.keys())
+        bounds: List[Tuple[float,float]] = []
+        int_flags: List[bool] = []
+        for k in keys:
+            vals = self.param_grid[k]
+            low, high = min(vals), max(vals)
+            bounds.append((low, high))
+            int_flags.append(all(isinstance(v, int) for v in vals))
+
+        def _func(x: List[float]) -> float:
+            kwargs: Dict[str, Any] = {}
+            for xi, k, is_int in zip(x, keys, int_flags):
+                kwargs[k] = int(round(xi)) if is_int else float(xi)
+            try:
+                strat = self.strategy_cls(**kwargs)
+                eq    = strat.backtest(data)
+                perf  = PerformanceAnalyzer(eq, strat.returns).summary()[metric]
+                return -perf
+            except Exception:
+                return 1e6
+
+        result = differential_evolution(_func, bounds, maxiter=maxiter, popsize=popsize)
+        best_x = result.x
+
+        best_kwargs: Dict[str, Any] = {}
+        for xi, k, is_int in zip(best_x, keys, int_flags):
+            best_kwargs[k] = int(round(xi)) if is_int else float(xi)
+
+        best_strat  = self.strategy_cls(**best_kwargs)
+        best_eq     = best_strat.backtest(data)
+        # best_metric = PerformanceAnalyzer(best_eq, best_strategies.returns).summary()[metric]
+        best_metric = PerformanceAnalyzer(best_eq, best_strat.returns).summary()[metric]
+
+        return best_kwargs, best_metric, result
 
     def best_params(
         self,
         results: pd.DataFrame,
         idx: int = 0
     ) -> Dict[str, Any]:
-        """
-        Return the top‐ranked parameter combination as a native‐typed dict.
-        """
+        """Extract native‐typed best parameter combo from a results DataFrame."""
         row = results.iloc[idx]
         out: Dict[str, Any] = {}
-        for k in self.param_grid:
+        for k in self.param_grid.keys():
             v = row[k]
-            # unwrap numpy scalars
-            if hasattr(v, "item"):
+            if hasattr(v, 'item'):
                 v = v.item()
-            # convert floats that are actually ints
             if isinstance(v, float) and v.is_integer():
                 v = int(v)
             out[k] = v
@@ -280,25 +344,21 @@ class Optimizer:
         data: pd.DataFrame,
         metric: str = 'Sharpe',
         idx: int = 0
-    ) -> Tuple[TradingStrategy, pd.Series, pd.DataFrame]:
+    ) -> Tuple[Optional[TradingStrategy], Optional[pd.Series], Optional[pd.DataFrame]]:
         """
-        1) Runs optimize()  
-        2) Finds the best params  
-        3) Safely instantiates & backtests that single strategy  
-        Returns (strategy_instance, equity_curve, full_results_df).
+        1) Run grid search
+        2) Pick best params
+        3) Safely instantiate & backtest that single strategy
+        Returns (strat, equity, results_df) or (None, None, results_df) on failure.
         """
-        results = self.optimize(data, metric)
+        results = self.optimize_grid(data, metric)
         params  = self.best_params(results, idx)
 
         try:
             strat = self.strategy_cls(**params)
             eq    = strat.backtest(data)
         except Exception as e:
-            logging.warning(
-                f"Optimizer.best_strategy: failed to backtest best "
-                f"{self.strategy_cls.__name__}{params} due to: {e}"
-            )
-            # return None strategy/equity so the caller can skip if desired
+            logging.warning(f"best_strategy failed for {params}: {e}")
             return None, None, results
 
         return strat, eq, results
