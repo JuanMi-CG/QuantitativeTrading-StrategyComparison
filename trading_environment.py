@@ -200,15 +200,15 @@ class PerformanceAnalyzer:
 
 
 
-import logging
-from itertools import product
-from typing import Type, Dict, Any, List, Tuple, Optional
+# import logging
+# from itertools import product
+# from typing import Type, Dict, Any, List, Tuple, Optional
 
-import pandas as pd
-from scipy.optimize import differential_evolution
-import optuna
+# import pandas as pd
+# from scipy.optimize import differential_evolution
+# import optuna
 
-from trading_environment import TradingStrategy, PerformanceAnalyzer
+# from trading_environment import TradingStrategy, PerformanceAnalyzer
 
 class Optimizer:
     """
@@ -216,13 +216,34 @@ class Optimizer:
     plus helpers to extract best params and build the best strategy safely.
     """
 
-    def __init__(
-        self,
-        strategy_cls: Type[TradingStrategy],
-        param_grid: Dict[str, List[Any]]
-    ):
+    def __init__(self, strategy_cls: Type[TradingStrategy]):
         self.strategy_cls = strategy_cls
-        self.param_grid   = param_grid
+        # -----------------------------------------------------
+        # Build a 'param_grid' dictionary from the strategy's
+        # `param_config` metadata so we never hand-craft grids again
+        config = getattr(strategy_cls, 'param_config', None)
+        if config is None:
+            raise ValueError(f"{strategy_cls.__name__} must define .param_config")
+
+        grid = {}
+        for name, spec in config.items():
+            # categorical choices
+            if 'choices' in spec:
+                grid[name] = spec['choices']
+                continue
+
+            # numeric range
+            t = spec['type']
+            low, high = spec['bounds']
+            # integer with explicit step
+            if t is int:
+                step = spec.get('step', 1)
+                grid[name] = list(range(low, high + 1, step))
+            else:  # float
+                n = spec.get('n', 10)
+                grid[name] = list(np.linspace(low, high, n))
+
+        self.param_grid = grid
 
     def optimize_grid(
         self,
@@ -234,7 +255,7 @@ class Optimizer:
         for vals in product(*self.param_grid.values()):
             params = dict(zip(self.param_grid.keys(), vals))
             try:
-                strat = self.strategy_cls(**params)
+                strat = self.strategy_cls(params)
                 eq    = strat.backtest(data)
                 perf  = PerformanceAnalyzer(eq, strat.returns).summary().to_dict()
                 perf.update(params)
@@ -253,6 +274,7 @@ class Optimizer:
         seed: Optional[int] = None
     ) -> Tuple[Dict[str, Any], float, optuna.Study]:
         """Bayesian optimization via Optuna."""
+
         def _objective(trial: optuna.Trial) -> float:
             kwargs: Dict[str, Any] = {}
             for k, choices in self.param_grid.items():
@@ -264,10 +286,14 @@ class Optimizer:
                     kwargs[k] = trial.suggest_float(k, low, high)
                 else:
                     kwargs[k] = trial.suggest_categorical(k, choices)
-            strat = self.strategy_cls(**kwargs)
-            eq    = strat.backtest(data)
-            perf  = PerformanceAnalyzer(eq, strat.returns).summary()[metric]
-            return -perf  # minimize negative Sharpe
+            try:
+                strat = self.strategy_cls(kwargs)
+                eq    = strat.backtest(data)
+                perf  = PerformanceAnalyzer(eq, strat.returns).summary()[metric]
+                return -perf  # minimize negative Sharpe
+            except Exception:
+                # invalid parameter combo: assign large penalty
+                return float('inf')
 
         study = optuna.create_study(
             direction='minimize',
@@ -287,35 +313,66 @@ class Optimizer:
         popsize: int = 10
     ) -> Tuple[Dict[str, Any], float, object]:
         """Differential Evolution via SciPy."""
-        keys = list(self.param_grid.keys())
+        # separate numeric vs categorical params
+        keys = []
         bounds: List[Tuple[float,float]] = []
         int_flags: List[bool] = []
-        for k in keys:
-            vals = self.param_grid[k]
-            low, high = min(vals), max(vals)
-            bounds.append((low, high))
-            int_flags.append(all(isinstance(v, int) for v in vals))
+        cat_map: Dict[str, List[Any]] = {}
+        for k, vals in self.param_grid.items():
+            if all(isinstance(v, (int, float)) for v in vals):
+                # numeric param
+                low, high = min(vals), max(vals)
+                keys.append(k)
+                bounds.append((low, high))
+                int_flags.append(all(isinstance(v, int) for v in vals))
+            else:
+                # categorical: map to integer indices
+                cat_map[k] = list(vals)
+                keys.append(k)
+                bounds.append((0, len(vals) - 1))
+                int_flags.append(True)
 
         def _func(x: List[float]) -> float:
+            # catch any NaNs early and give a big penalty
+            if np.any(np.isnan(x)):
+                return 1e6
             kwargs: Dict[str, Any] = {}
             for xi, k, is_int in zip(x, keys, int_flags):
-                kwargs[k] = int(round(xi)) if is_int else float(xi)
+                if k in cat_map:
+                    # pick category by rounded index, clipped to valid range
+                    idx = int(round(xi))
+                    idx = max(0, min(idx, len(cat_map[k]) - 1))
+                    kwargs[k] = cat_map[k][idx]
+                else:
+                    kwargs[k] = int(round(xi)) if is_int else float(xi)
+
             try:
-                strat = self.strategy_cls(**kwargs)
+                strat = self.strategy_cls(kwargs)
                 eq    = strat.backtest(data)
                 perf  = PerformanceAnalyzer(eq, strat.returns).summary()[metric]
                 return -perf
             except Exception:
                 return 1e6
 
-        result = differential_evolution(_func, bounds, maxiter=maxiter, popsize=popsize)
+        # turn off the continuous “polish” step so we don’t confuse L-BFGS-B
+        result = differential_evolution(
+            _func, bounds,
+            maxiter=maxiter,
+            popsize=popsize,
+            polish=False
+        )
         best_x = result.x
 
         best_kwargs: Dict[str, Any] = {}
         for xi, k, is_int in zip(best_x, keys, int_flags):
-            best_kwargs[k] = int(round(xi)) if is_int else float(xi)
+            if k in cat_map:
+                idx = int(round(xi))
+                idx = max(0, min(idx, len(cat_map[k]) - 1))
+                best_kwargs[k] = cat_map[k][idx]
+            else:
+                best_kwargs[k] = int(round(xi)) if is_int else float(xi)
 
-        best_strat  = self.strategy_cls(**best_kwargs)
+        best_strat  = self.strategy_cls(best_kwargs)
         best_eq     = best_strat.backtest(data)
         # best_metric = PerformanceAnalyzer(best_eq, best_strategies.returns).summary()[metric]
         best_metric = PerformanceAnalyzer(best_eq, best_strat.returns).summary()[metric]
@@ -355,7 +412,7 @@ class Optimizer:
         params  = self.best_params(results, idx)
 
         try:
-            strat = self.strategy_cls(**params)
+            strat = self.strategy_cls(params)
             eq    = strat.backtest(data)
         except Exception as e:
             logging.warning(f"best_strategy failed for {params}: {e}")
