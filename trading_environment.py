@@ -199,17 +199,6 @@ class PerformanceAnalyzer:
         })
 
 
-
-# import logging
-# from itertools import product
-# from typing import Type, Dict, Any, List, Tuple, Optional
-
-# import pandas as pd
-# from scipy.optimize import differential_evolution
-# import optuna
-
-# from trading_environment import TradingStrategy, PerformanceAnalyzer
-
 class Optimizer:
     """
     Three optimization routines over your strategy’s parameter space,
@@ -266,44 +255,66 @@ class Optimizer:
             raise ValueError(f"No valid grid combinations for {self.strategy_cls.__name__}")
         return pd.DataFrame(records).sort_values(by=metric, ascending=False).reset_index(drop=True)
 
-    def optimize_bayesian(
-        self,
-        data: pd.DataFrame,
-        metric: str = 'Sharpe',
-        n_trials: int = 50,
-        seed: Optional[int] = None
-    ) -> Tuple[Dict[str, Any], float, optuna.Study]:
-        """Bayesian optimization via Optuna."""
+    def sample_params(self, trial: optuna.trial.Trial) -> dict:
+        """
+        Turn self.strategy_cls.param_config into actual trial suggestions.
+        """
+        params = {}
+        for name, cfg in self.strategy_cls.param_config.items():
+            ptype = cfg['type']
+            if ptype is int:
+                lo, hi = cfg['bounds']
+                step  = cfg.get('step', 1)
+                params[name] = trial.suggest_int(name, lo, hi, step=step)
 
-        def _objective(trial: optuna.Trial) -> float:
-            kwargs: Dict[str, Any] = {}
-            for k, choices in self.param_grid.items():
-                if all(isinstance(c, int) for c in choices):
-                    low, high = min(choices), max(choices)
-                    kwargs[k] = trial.suggest_int(k, low, high)
-                elif all(isinstance(c, float) for c in choices):
-                    low, high = min(choices), max(choices)
-                    kwargs[k] = trial.suggest_float(k, low, high)
+            elif ptype is float:
+                lo, hi = cfg['bounds']
+                step  = cfg.get('step', None)
+                if step:
+                    params[name] = trial.suggest_float(name, lo, hi, step=step)
                 else:
-                    kwargs[k] = trial.suggest_categorical(k, choices)
+                    params[name] = trial.suggest_float(name, lo, hi)
+
+            elif ptype is str:
+                choices = cfg['choices']
+                params[name] = trial.suggest_categorical(name, choices)
+
+            else:
+                raise TypeError(f"Unsupported param type for {name}: {ptype}")
+
+        return params
+
+    def optimize_bayesian(self, data, metric, n_trials, seed):
+        def objective(trial):
+            # 1) sample hyperparameters
+            params = self.sample_params(trial)
+
             try:
-                strat = self.strategy_cls(kwargs)
-                eq    = strat.backtest(data)
-                perf  = PerformanceAnalyzer(eq, strat.returns).summary()[metric]
-                return -perf  # minimize negative Sharpe
-            except Exception:
-                # invalid parameter combo: assign large penalty
-                return float('inf')
+                # 2) build & backtest
+                strat  = self.strategy_cls(params)
+                equity = strat.backtest(data)
+
+                # 3) compute metric via your analyzer
+                perf    = PerformanceAnalyzer(equity, strat.returns)
+                summary = perf.summary()             # a DataFrame or dict
+                score   = summary.loc[metric, 'Value']  # or summary[metric]
+
+                # 4) guard against non‐finite
+                return float(score) if np.isfinite(score) else float('nan')
+
+            except Exception as e:
+                trial.set_user_attr("error", str(e))
+                return float('nan')
 
         study = optuna.create_study(
-            direction='minimize',
-            sampler=optuna.samplers.TPESampler(seed=seed)
+            direction='maximize' if metric.lower()=='sharpe' else 'minimize',
+            sampler=optuna.samplers.TPESampler(seed=seed),
         )
-        study.optimize(_objective, n_trials=n_trials)
+        study.optimize(objective, n_trials=n_trials)
+        best = study.best_trial
+        return best.params, best.value, study
 
-        best_params = study.best_params
-        best_metric = -study.best_value
-        return best_params, best_metric, study
+
 
     def optimize_de(
         self,
@@ -331,6 +342,15 @@ class Optimizer:
                 keys.append(k)
                 bounds.append((0, len(vals) - 1))
                 int_flags.append(True)
+
+        # If there are no parameters to tune, just backtest with the default ctor
+        if not bounds:
+            default_kwargs = {}  # no params
+            strat  = self.strategy_cls(default_kwargs)
+            eq     = strat.backtest(data)
+            perf   = PerformanceAnalyzer(eq, strat.returns).summary()[metric]
+            # result is None (or you could return result=result if you like)
+            return default_kwargs, perf, None
 
         def _func(x: List[float]) -> float:
             # catch any NaNs early and give a big penalty
@@ -396,31 +416,63 @@ class Optimizer:
             out[k] = v
         return out
 
-    def best_strategy(
-        self,
+    @staticmethod
+    def find_best_strategy(
+        strategies: List[Type['TradingStrategy']],
         data: pd.DataFrame,
+        method: str = 'bayes',
         metric: str = 'Sharpe',
-        idx: int = 0
-    ) -> Tuple[Optional[TradingStrategy], Optional[pd.Series], Optional[pd.DataFrame]]:
+        **method_kwargs: Any
+    ) -> Tuple['TradingStrategy', Dict[str, Any], pd.DataFrame]:
         """
-        1) Run grid search
-        2) Pick best params
-        3) Safely instantiate & backtest that single strategy
-        Returns (strat, equity, results_df) or (None, None, results_df) on failure.
+        For each strategy class:
+          1) find its best params via `method`
+          2) backtest that best-param strategy
+          3) compute its performance summary
+        
+        Returns:
+          - best_strategy (TradingStrategy instance)
+          - best_params  (dict for that strategy)
+          - perf_df      (DataFrame of performance metrics, indexed by strategy name)
         """
-        results = self.optimize_grid(data, metric)
-        params  = self.best_params(results, idx)
+        perf_records = []   # will hold {strategy, Total Return, Ann. Return, Sharpe, …}
+        rec_map = {}        # map strategy name → (cls, best_params)
 
-        try:
-            strat = self.strategy_cls(params)
+        for cls in strategies:
+            opt = Optimizer(cls)
+            # 1) optimize
+            if method == 'bayes':
+                best_params, _, _ = opt.optimize_bayesian(data, metric=metric, **method_kwargs)
+            elif method == 'de':
+                best_params, _, _ = opt.optimize_de   (data, metric=metric, **method_kwargs)
+            elif method == 'grid':
+                df = opt.optimize_grid(data, metric=metric)
+                best_params = opt.best_params(df)
+            else:
+                raise ValueError(f"Unknown optimization method: {method}")
+
+            # 2) backtest best
+            strat = cls(best_params)
             eq    = strat.backtest(data)
-        except Exception as e:
-            logging.warning(f"best_strategy failed for {params}: {e}")
-            return None, None, results
+            
+            # 3) summarize
+            summary = PerformanceAnalyzer(eq, strat.returns).summary().to_dict()
+            perf_records.append({'strategy': cls.__name__, **summary})
+            rec_map[cls.__name__] = (cls, best_params)
 
-        return strat, eq, results
+        # build a DataFrame of performance, sort by `metric`
+        perf_df = (
+            pd.DataFrame(perf_records)
+              .set_index('strategy')
+              .sort_values(by=metric, ascending=False)
+        )
 
+        # pick top row
+        best_name = perf_df.index[0]
+        best_cls, best_params = rec_map[best_name]
+        best_strategy = best_cls(best_params)
 
+        return best_strategy, best_params, perf_df
 
 class StrategyManager:
     """

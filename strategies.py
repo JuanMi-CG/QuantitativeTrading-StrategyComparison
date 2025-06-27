@@ -239,8 +239,8 @@ class RSIStrategy(TradingStrategy):
 class PairTradingStrategy(TradingStrategy):
     # expects two symbols and a rolling window
     param_config = {
-        's1': {'type': str, 'choices': ['GS', 'MS', 'AAPL', 'BTC', 'ETH']},
-        's2': {'type': str, 'choices': ['GS', 'MS', 'AAPL', 'BTC', 'ETH']},
+        's1': {'type': str, 'choices': ['GS', 'AAPL', 'BTC-USD', 'ETH-USD']},
+        's2': {'type': str, 'choices': ['GS', 'AAPL', 'BTC-USD', 'ETH-USD']},
         'window': {'type': int, 'bounds': (5, 60), 'step': 5},
     }
 
@@ -254,39 +254,48 @@ class PairTradingStrategy(TradingStrategy):
         self.window = params['window']
         super().__init__(name=f"Pair {self.s1}/{self.s2} w={self.window}")
 
-    def _norm(self, sym: str) -> str:
-        # ensure full ticker for DataManager (e.g. 'BTC' -> 'BTC-USD')
-        return sym if '-' in sym else f"{sym}-USD"
 
     def generate_signals(self, data: pd.DataFrame) -> pd.Series:
-        # Fetch both series fresh (ignore passed-in data), to ensure clean close prices
-        dm = DataManager(data_dir=DATA_DIR, max_file_size=MAX_FILE_SIZE)
-        t1, t2 = self._norm(self.s1), self._norm(self.s2)
-        df1 = dm.load_data(symbols=t1, period='2y', interval='1d')
-        df2 = dm.load_data(symbols=t2, period='2y', interval='1d')
+        # 1) If both legs are the same, no spread→ flat zeros
+        if self.s1 == self.s2:
+            return pd.Series(0, index=data.index, name='signal')
 
-        # extract price_col (e.g. 'Close') and rename to param names
-        series1 = df1[self.price_col].rename(self.s1)
-        series2 = df2[self.price_col].rename(self.s2)
+        # 2) load fresh each series
+        dm  = DataManager(data_dir=DATA_DIR, max_file_size=MAX_FILE_SIZE)
+        df1 = dm.load_data(symbols=self.s1, period='2y', interval='1d')
+        df2 = dm.load_data(symbols=self.s2, period='2y', interval='1d')
 
-        # align both on dates
-        df = pd.concat([series1, series2], axis=1).dropna()
+        s1 = df1[self.price_col].rename(self.s1)
+        s2 = df2[self.price_col].rename(self.s2)
+
+        # align on the same dates
+        df = pd.concat([s1, s2], axis=1).dropna()
+
         p1 = df[self.s1]
         p2 = df[self.s2]
 
-        # compute spread and rolling stats
+        # if you still end up with a DataFrame (duplicate names),
+        # just grab the first column
+        if isinstance(p1, pd.DataFrame):
+            p1 = p1.iloc[:, 0]
+        if isinstance(p2, pd.DataFrame):
+            p2 = p2.iloc[:, 0]
+
+        # compute spread stats
         spread = p1 - p2
-        mu = spread.rolling(self.window).mean()
-        sigma = spread.rolling(self.window).std()
+        mu     = spread.rolling(self.window).mean()
+        sigma  = spread.rolling(self.window).std()
 
-        # long when spread below mean - std, short above mean + std
-        signal = pd.Series(0, index=spread.index)
-        signal[spread < mu - sigma] = 1
-        signal[spread > mu + sigma] = -1
+        # build your signal
+        signal = pd.Series(0, index=spread.index, name='signal')
+        mask_long  = spread < (mu - sigma)
+        mask_short = spread > (mu + sigma)
+
+        # 3) _always_ use .loc for boolean assignment
+        signal.loc[mask_long]  =  1
+        signal.loc[mask_short] = -1
+
         return signal.ffill().fillna(0)
-
-
-
 
 
 
