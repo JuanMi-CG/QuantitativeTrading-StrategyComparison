@@ -1,7 +1,6 @@
 __init__.py
 __pycache__/
 data/*
-notebooks/*
 reports/*
 strategies/*
 venv310
