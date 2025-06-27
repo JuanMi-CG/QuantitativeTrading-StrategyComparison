@@ -1,11 +1,14 @@
-from imports import *
-set_verbosity(WARNING)
+from .imports import *
 
 # Configuración básica de logging
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s'
 )
+
+# Suppress less important logs
+logging.getLogger().setLevel(logging.ERROR)  # hide WARNING and INFO logs
+set_verbosity(ERROR)  # hide Optuna warnings
 
 # Directorios principales
 DATA_DIR = Path('data')
@@ -818,7 +821,7 @@ class StrategyCollection:
         for vals in product(*self.param_grid.values()):
             params = dict(zip(self.param_grid.keys(), vals))
             try:
-                strat = self.strategy_cls(**params)
+                strat = self.strategy_cls(params)
             except Exception as e:
                 # aquí strat.name aún no existe, así que usamos params para el warning
                 pname = f"{self.strategy_cls.__name__}({params})"

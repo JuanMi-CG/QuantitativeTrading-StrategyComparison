@@ -1,5 +1,5 @@
-from imports import *
-from trading_environment import *
+from .imports import *
+from .trading_environment import *
 
 
 # --- Trading Strategies classes with auto‐tunable param_config: ---

@@ -25,6 +25,7 @@ from itertools import product
 
 from scipy.optimize import differential_evolution
 import optuna
-from optuna.logging import set_verbosity, WARNING
+from optuna.logging import set_verbosity, WARNING, ERROR
+
 import ta
 
