@@ -441,27 +441,36 @@ class Optimizer:
         equity_map: Dict[str, pd.Series] = {}
 
         for cls in strategies:
-            opt = Optimizer(cls)
-            # 1) optimize
-            if method == 'bayes':
-                best_params, _, _ = opt.optimize_bayesian(data, metric=metric, **method_kwargs)
-            elif method == 'de':
-                best_params, _, _ = opt.optimize_de(data, metric=metric, **method_kwargs)
-            elif method == 'grid':
-                df = opt.optimize_grid(data, metric=metric)
-                best_params = opt.best_params(df)
-            else:
-                raise ValueError(f"Unknown optimization method: {method}")
+            try:
+                opt = Optimizer(cls)
+                # 1) optimize
+                if method == 'bayes':
+                    best_params, _, _ = opt.optimize_bayesian(data, metric=metric, **method_kwargs)
+                elif method == 'de':
+                    best_params, _, _ = opt.optimize_de(data, metric=metric, **method_kwargs)
+                elif method == 'grid':
+                    df = opt.optimize_grid(data, metric=metric)
+                    best_params = opt.best_params(df)
+                else:
+                    logging.warning(f"Unknown optimization method: {method}, skipping {cls.__name__}")
+                    continue
 
-            # 2) backtest best
-            strat = cls(best_params)
-            eq = strat.backtest(data)
-            equity_map[strat.name] = eq
+                # 2) instantiate and backtest best
+                strat = cls(best_params)
+                eq = strat.backtest(data)
+                equity_map[strat.name] = eq
 
-            # 3) summarize
-            summary = PerformanceAnalyzer(eq, strat.returns).summary().to_dict()
-            perf_records.append({'strategy': strat.name, **summary})
-            rec_map[strat.name] = (cls, best_params)
+                # 3) summarize
+                summary = PerformanceAnalyzer(eq, strat.returns).summary().to_dict()
+                perf_records.append({'strategy': strat.name, **summary})
+                rec_map[strat.name] = (cls, best_params)
+
+            except Exception as e:
+                logging.warning(f"Skipping {cls.__name__} due to error after optimization: {e}")
+                continue
+
+        if not perf_records:
+            raise ValueError("No valid strategies found during optimization.")
 
         # build a DataFrame of performance, sort by `metric`
         perf_df = (
@@ -476,6 +485,7 @@ class Optimizer:
         best_strategy = best_cls(best_params)
 
         return best_strategy, best_params, perf_df, equity_map
+
 
 
 class StrategyManager:
