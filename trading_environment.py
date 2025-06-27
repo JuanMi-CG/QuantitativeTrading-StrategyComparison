@@ -259,52 +259,50 @@ class Optimizer:
         """
         Turn self.strategy_cls.param_config into actual trial suggestions.
         """
-        params = {}
+        params: Dict[str, Any] = {}
         for name, cfg in self.strategy_cls.param_config.items():
-            ptype = cfg['type']
+            # categorical?
+            if 'choices' in cfg:
+                params[name] = trial.suggest_categorical(name, cfg['choices'])
+                continue
+
+            # otherwise must have a type + bounds
+            ptype = cfg.get('type')
             if ptype is int:
                 lo, hi = cfg['bounds']
-                step  = cfg.get('step', 1)
+                step   = cfg.get('step', 1)
                 params[name] = trial.suggest_int(name, lo, hi, step=step)
 
             elif ptype is float:
                 lo, hi = cfg['bounds']
-                step  = cfg.get('step', None)
+                step   = cfg.get('step', None)
                 if step:
                     params[name] = trial.suggest_float(name, lo, hi, step=step)
                 else:
                     params[name] = trial.suggest_float(name, lo, hi)
 
-            elif ptype is str:
-                choices = cfg['choices']
-                params[name] = trial.suggest_categorical(name, choices)
-
             else:
-                raise TypeError(f"Unsupported param type for {name}: {ptype}")
+                raise TypeError(f"Unsupported or missing param_config for {name}: {cfg}")
 
         return params
 
     def optimize_bayesian(self, data, metric, n_trials, seed):
         def objective(trial):
-            # 1) sample hyperparameters
             params = self.sample_params(trial)
-
             try:
-                # 2) build & backtest
-                strat  = self.strategy_cls(params)
-                equity = strat.backtest(data)
-
-                # 3) compute metric via your analyzer
+                strat   = self.strategy_cls(params)
+                equity  = strat.backtest(data)
                 perf    = PerformanceAnalyzer(equity, strat.returns)
-                summary = perf.summary()             # a DataFrame or dict
-                score   = summary.loc[metric, 'Value']  # or summary[metric]
-
-                # 4) guard against non‐finite
-                return float(score) if np.isfinite(score) else float('nan')
-
+                summary = perf.summary()
+                score   = summary[metric]
+                # penalize non‐finite scores
+                if not np.isfinite(score):
+                    return float('-inf')
+                return float(score)
             except Exception as e:
                 trial.set_user_attr("error", str(e))
-                return float('nan')
+                return float('-inf')
+
 
         study = optuna.create_study(
             direction='maximize' if metric.lower()=='sharpe' else 'minimize',
