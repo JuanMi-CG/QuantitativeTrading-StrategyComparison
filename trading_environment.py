@@ -1,4 +1,5 @@
 from imports import *
+set_verbosity(WARNING)
 
 # Configuración básica de logging
 logging.basicConfig(
@@ -54,7 +55,7 @@ class DataManager:
         if parts:
             dfs = [pd.read_csv(p, index_col=[0,1], parse_dates=[0]) for p in parts]
             df = pd.concat(dfs).sort_index()
-            logging.info(f"Cargados {len(df)} registros de caché ({len(parts)} archivos)")
+            # logging.info(f"Cargados {len(df)} registros de caché ({len(parts)} archivos)")
             return df
 
         logging.info(f"Descargando tickers={sym_list}, start={start}, end={end}, period={period}, interval={interval}")
@@ -421,20 +422,23 @@ class Optimizer:
         method: str = 'bayes',
         metric: str = 'Sharpe',
         **method_kwargs: Any
-    ) -> Tuple['TradingStrategy', Dict[str, Any], pd.DataFrame]:
+    ) -> Tuple['TradingStrategy', Dict[str, Any], pd.DataFrame, Dict[str, pd.Series]]:
         """
         For each strategy class:
           1) find its best params via `method`
           2) backtest that best-param strategy
           3) compute its performance summary
-        
+          4) store its equity curve
+
         Returns:
           - best_strategy (TradingStrategy instance)
           - best_params  (dict for that strategy)
           - perf_df      (DataFrame of performance metrics, indexed by strategy name)
+          - equity_map   (dict mapping strategy name to its equity Series)
         """
-        perf_records = []   # will hold {strategy, Total Return, Ann. Return, Sharpe, …}
-        rec_map = {}        # map strategy name → (cls, best_params)
+        perf_records: List[Dict[str, Any]] = []
+        rec_map: Dict[str, Tuple[Type['TradingStrategy'], Dict[str, Any]]] = {}
+        equity_map: Dict[str, pd.Series] = {}
 
         for cls in strategies:
             opt = Optimizer(cls)
@@ -442,7 +446,7 @@ class Optimizer:
             if method == 'bayes':
                 best_params, _, _ = opt.optimize_bayesian(data, metric=metric, **method_kwargs)
             elif method == 'de':
-                best_params, _, _ = opt.optimize_de   (data, metric=metric, **method_kwargs)
+                best_params, _, _ = opt.optimize_de(data, metric=metric, **method_kwargs)
             elif method == 'grid':
                 df = opt.optimize_grid(data, metric=metric)
                 best_params = opt.best_params(df)
@@ -451,12 +455,13 @@ class Optimizer:
 
             # 2) backtest best
             strat = cls(best_params)
-            eq    = strat.backtest(data)
-            
+            eq = strat.backtest(data)
+            equity_map[strat.name] = eq
+
             # 3) summarize
             summary = PerformanceAnalyzer(eq, strat.returns).summary().to_dict()
-            perf_records.append({'strategy': cls.__name__, **summary})
-            rec_map[cls.__name__] = (cls, best_params)
+            perf_records.append({'strategy': strat.name, **summary})
+            rec_map[strat.name] = (cls, best_params)
 
         # build a DataFrame of performance, sort by `metric`
         perf_df = (
@@ -465,12 +470,13 @@ class Optimizer:
               .sort_values(by=metric, ascending=False)
         )
 
-        # pick top row
+        # pick top
         best_name = perf_df.index[0]
         best_cls, best_params = rec_map[best_name]
         best_strategy = best_cls(best_params)
 
-        return best_strategy, best_params, perf_df
+        return best_strategy, best_params, perf_df, equity_map
+
 
 class StrategyManager:
     """
