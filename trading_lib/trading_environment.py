@@ -683,20 +683,35 @@ class ReportManager:
     def plot_equity_curves(
         self,
         equity_dict: Dict[str, pd.Series],
-        figsize: tuple = (10, 5)
+        perf_df: Optional[pd.DataFrame]   = None,
+        top_n:    Optional[int]           = None,
+        top_n_metric: Optional[str]       = None,
+        figsize:  tuple                   = (10, 5)
     ) -> None:
         """
-        Overlay equity curves of multiple strategies.
-
-        - equity_dict: mapping name to equity Series
+        Overlay equity curves of multiple strategies, optionally filtering to the top N
+        by a chosen metric in perf_df.
         """
+        names = list(equity_dict.keys())
+        # if perf_df & filtering requested, pick top_n by metric
+        if perf_df is not None and top_n and top_n_metric:
+            if top_n_metric not in perf_df.columns:
+                raise KeyError(f"Metric '{top_n_metric}' not in perf_df")
+            # sort descending, then take those also in equity_dict
+            ordered = perf_df.sort_values(by=top_n_metric, ascending=False)
+            names = [n for n in ordered.index if n in equity_dict][:top_n]
+
         plt.figure(figsize=figsize)
-        for name, eq in equity_dict.items():
+        for name in names:
+            eq    = equity_dict[name]
             dates = _extract_dates(eq.index)
             plt.plot(dates, eq.values, label=name)
+
         plt.title("Equity Curves Comparison")
         plt.legend()
         plt.show()
+
+
 
     def save_summary(self, name: str, summary: pd.Series) -> None:
         path = self.directory / f"{name}.csv"
@@ -798,7 +813,6 @@ class StrategyCollection:
         self.strategies: Dict[str, TradingStrategy] = {}
 
         if strategies is not None:
-            # load from provided list
             for strat in strategies:
                 if strat.name in self.strategies:
                     logging.warning(f"Duplicate strategy name '{strat.name}', skipping")
@@ -806,36 +820,56 @@ class StrategyCollection:
                 self.strategies[strat.name] = strat
             return
 
-        # otherwise, must have strategy_cls & param_grid
-        if strategy_cls is None or param_grid is None:
-            raise ValueError("Must provide either `strategies` or (`strategy_cls` and `param_grid`)")
+        # must have strategy_cls
+        if strategy_cls is None:
+            raise ValueError("Must provide either `strategies` or `strategy_cls`")
+
         self.strategy_cls = strategy_cls
-        self.param_grid  = param_grid
+
+        # if user didn’t pass a grid, build from strategy.param_config
+        if param_grid is None:
+            config = getattr(strategy_cls, 'param_config', None)
+            if config is None:
+                raise ValueError(f"{strategy_cls.__name__} has no `.param_config`")
+            self.param_grid = self._build_grid_from_config(config)
+        else:
+            self.param_grid = param_grid
+
         self._generate_strategies()
 
+    @staticmethod
+    def _build_grid_from_config(config: Dict[str, dict]) -> Dict[str, List[Any]]:
+        grid: Dict[str, List[Any]] = {}
+        for name, spec in config.items():
+            # categorical
+            if 'choices' in spec:
+                grid[name] = spec['choices']
+            else:
+                t = spec['type']
+                low, high = spec['bounds']
+                if t is int:
+                    step = spec.get('step', 1)
+                    grid[name] = list(range(low, high + 1, step))
+                else:
+                    n = spec.get('n', 10)
+                    grid[name] = list(np.linspace(low, high, n))
+        return grid
+
     def _generate_strategies(self) -> None:
-        """
-        Crea instancias de la estrategia para cada combinación de parámetros.
-        Usa el .name que la propia clase haya definido.
-        """
         for vals in product(*self.param_grid.values()):
             params = dict(zip(self.param_grid.keys(), vals))
             try:
                 strat = self.strategy_cls(params)
             except Exception as e:
-                # aquí strat.name aún no existe, así que usamos params para el warning
                 pname = f"{self.strategy_cls.__name__}({params})"
                 logging.warning(f"Skipping strategy '{pname}': {e}")
                 continue
 
-            # Aquí aprovechamos el .name que la estrategia ya haya generado
-            name = strat.name
-
-            if name in self.strategies:
-                logging.warning(f"Duplicate strategy name '{name}', skipping")
+            if strat.name in self.strategies:
+                logging.warning(f"Duplicate strategy name '{strat.name}', skipping")
                 continue
 
-            self.strategies[name] = strat
+            self.strategies[strat.name] = strat
 
     def _format_name(self, params: Dict[str, Any]) -> str:
         """
@@ -880,6 +914,49 @@ class StrategyCollection:
             )
             equity_dict[name] = eq
         return equity_dict
+    
+    def backtest_and_performance_all(
+        self,
+        symbol: str,
+        period: str = '1y',
+        interval: str = '1d',
+        initial_capital: float = 10000.0,
+        transaction_cost: float = 0.0,
+        risk_manager: Optional['RiskManager'] = None,
+        stop_loss: Optional[float] = None,
+        sort_by: str = 'Sharpe',
+        ascending: bool = False
+    ) -> Tuple[pd.DataFrame, Dict[str, pd.Series]]:
+        """
+        Backtestea todas las estrategias y calcula sus métricas de rendimiento.
+
+        Returns:
+         - perf_df: DataFrame indexado por nombre de estrategia con todas las métricas.
+         - equity_dict: dict mapping nombre de estrategia a su curva de equity.
+        """
+        # 1) backtest all to get equity curves
+        equity_dict = self.backtest_all(
+            symbol=symbol,
+            period=period,
+            interval=interval,
+            initial_capital=initial_capital,
+            transaction_cost=transaction_cost,
+            risk_manager=risk_manager,
+            stop_loss=stop_loss
+        )
+
+        # 2) compute performance summaries
+        records = []
+        for name, eq in equity_dict.items():
+            strat = self.strategies[name]
+            perf = PerformanceAnalyzer(eq, strat.returns).summary()
+            perf.name = name
+            records.append(perf)
+
+        # 3) build and sort DataFrame
+        perf_df = pd.DataFrame(records).sort_values(by=sort_by, ascending=ascending)
+        return perf_df, equity_dict
+
 
     def save_all(self, strategy_manager: 'StrategyManager', directory: Optional[Path] = None) -> None:
         """
