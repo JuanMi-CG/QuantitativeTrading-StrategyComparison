@@ -4,6 +4,18 @@ from .trading_environment import *
 
 # --- Trading Strategies classes with auto‐tunable param_config: ---
 
+class Benchmark(TradingStrategy):
+    # Siempre en posición larga (1).
+    param_config = {}  # sin parámetros a tunear
+
+    def __init__(self, params: dict = None, price_col: str = 'close'):
+        super().__init__(name='Benchmark', price_col=price_col)
+
+    def generate_signals(self, data):
+        # señal = +1 cada día
+        return pd.Series(1, index=data.index)
+
+
 class MovingAverageCrossStrategy(TradingStrategy):
     # auto‐tunable params: integer windows
     param_config = {
@@ -42,7 +54,7 @@ class DcaStrategy(TradingStrategy):
     # amount: continuous from 100 to 2000 (10 samples), freq: categorical
     param_config = {
         'amount': {'type': float, 'bounds': (100.0, 2000.0), 'n': 10},
-        'freq':   {'choices': ['D', 'W', 'M']}
+        'freq':   {'choices': ['D', 'W', 'ME']}
     }
 
     def __init__(self, params: dict, price_col: str = 'close'):

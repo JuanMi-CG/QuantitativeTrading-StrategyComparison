@@ -309,7 +309,7 @@ class Optimizer:
 
 
         study = optuna.create_study(
-            direction='maximize' if metric.lower()=='sharpe' else 'minimize',
+            direction='maximize' if metric.lower() in ['sharpe', 'total return'] else 'minimize',
             sampler=optuna.samplers.TPESampler(seed=seed),
         )
         study.optimize(objective, n_trials=n_trials)
@@ -425,23 +425,26 @@ class Optimizer:
         method: str = 'bayes',
         metric: str = 'Sharpe',
         **method_kwargs: Any
-    ) -> Tuple['TradingStrategy', Dict[str, Any], pd.DataFrame, Dict[str, pd.Series]]:
+    ) -> Tuple['TradingStrategy', Dict[str, Any], pd.DataFrame, Dict[str, pd.Series], Dict[str, 'TradingStrategy']]:
         """
         For each strategy class:
-          1) find its best params via `method`
-          2) backtest that best-param strategy
-          3) compute its performance summary
-          4) store its equity curve
+        1) find its best params via `method`
+        2) backtest that best-param strategy
+        3) compute its performance summary
+        4) store its equity curve
+        5) store strategy object
 
         Returns:
-          - best_strategy (TradingStrategy instance)
-          - best_params  (dict for that strategy)
-          - perf_df      (DataFrame of performance metrics, indexed by strategy name)
-          - equity_map   (dict mapping strategy name to its equity Series)
+        - best_strategy (TradingStrategy instance)
+        - best_params  (dict for that strategy)
+        - perf_df      (DataFrame of performance metrics, indexed by strategy name)
+        - equity_map   (dict mapping strategy name to its equity Series)
+        - strategy_obj_map (dict mapping strategy name to the strategy object)
         """
         perf_records: List[Dict[str, Any]] = []
         rec_map: Dict[str, Tuple[Type['TradingStrategy'], Dict[str, Any]]] = {}
         equity_map: Dict[str, pd.Series] = {}
+        strategy_obj_map: Dict[str, 'TradingStrategy'] = {}
 
         for cls in strategies:
             try:
@@ -462,6 +465,7 @@ class Optimizer:
                 strat = cls(best_params)
                 eq = strat.backtest(data)
                 equity_map[strat.name] = eq
+                strategy_obj_map[strat.name] = strat
 
                 # 3) summarize
                 summary = PerformanceAnalyzer(eq, strat.returns).summary().to_dict()
@@ -478,16 +482,12 @@ class Optimizer:
         # build a DataFrame of performance, sort by `metric`
         perf_df = (
             pd.DataFrame(perf_records)
-              .set_index('strategy')
-              .sort_values(by=metric, ascending=False)
+            .set_index('strategy')
+            .sort_values(by=metric, ascending=False)
         )
 
-        # pick top
-        best_name = perf_df.index[0]
-        best_cls, best_params = rec_map[best_name]
-        best_strategy = best_cls(best_params)
+        return perf_df, equity_map, strategy_obj_map
 
-        return best_strategy, best_params, perf_df, equity_map
 
 
 
@@ -680,18 +680,21 @@ class ReportManager:
         plt.tight_layout(rect=[0, 0.03, 1, 0.95])
         plt.show()
 
+
     def plot_equity_curves(
         self,
         equity_dict: Dict[str, pd.Series],
-        perf_df: Optional[pd.DataFrame]   = None,
+        perf_df: pd.DataFrame,
         top_n:    Optional[int]           = None,
-        top_n_metric: Optional[str]       = None,
+        top_n_metric: Optional[str]       = 'Sharpe',
         figsize:  tuple                   = (10, 5)
     ) -> None:
         """
         Overlay equity curves of multiple strategies, optionally filtering to the top N
         by a chosen metric in perf_df.
         """
+        top_n = top_n or len(equity_dict)
+
         names = list(equity_dict.keys())
         # if perf_df & filtering requested, pick top_n by metric
         if perf_df is not None and top_n and top_n_metric:
@@ -705,11 +708,22 @@ class ReportManager:
         for name in names:
             eq    = equity_dict[name]
             dates = _extract_dates(eq.index)
-            plt.plot(dates, eq.values, label=name)
+            if name.lower() == 'benchmark':
+                # Línea gruesa, guiones y color rojo para el benchmark
+                plt.plot(dates, eq.values,
+                        label=name,
+                        linewidth=2.5,
+                        linestyle='--',
+                        color='red')
+            else:
+                # Estilo por defecto para las demás curvas
+                plt.plot(dates, eq.values, label=name, linewidth=1)
+
 
         plt.title("Equity Curves Comparison")
         plt.legend()
         plt.show()
+
 
 
 
